@@ -266,6 +266,7 @@ export async function logoutSession(): Promise<void> {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
+          'x-session-token': token,
           'Content-Type': 'application/json',
         },
         body: '{}',

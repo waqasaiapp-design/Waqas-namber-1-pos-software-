@@ -138,32 +138,49 @@ const SUPER_ADMIN_POS_SHOP_ID = 'SHOP-SA-POS';
 // OPTIONAL SHARED KV STORE (Vercel KV / Upstash Redis REST API)
 // Enables multi-container persistence on Vercel Serverless Functions
 // -------------------------------------------------------------
-const KV_REST_URL = (
-  process.env.KV_REST_API_URL ||
-  process.env.UPSTASH_REDIS_REST_URL ||
-  ''
-).replace(/\/+$/, '');
-const KV_REST_TOKEN =
-  process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '';
-const isSharedKvEnabled = Boolean(KV_REST_URL && KV_REST_TOKEN);
+function getKvConfig(): { url: string; token: string; enabled: boolean } {
+  const url = (
+    process.env.KV_REST_API_URL ||
+    process.env.UPSTASH_REDIS_REST_URL ||
+    ''
+  ).replace(/\/+$/, '');
+  const token =
+    process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '';
+  return { url, token, enabled: Boolean(url && token) };
+}
+
+const initialKvCfg = getKvConfig();
+const isSharedKvEnabled = initialKvCfg.enabled;
+
+interface KvGetResult<T> {
+  ok: boolean;
+  found: boolean;
+  value: T | null;
+}
+
+async function kvGetResult<T>(key: string): Promise<KvGetResult<T>> {
+  const kv = getKvConfig();
+  if (!kv.enabled) return { ok: false, found: false, value: null };
+  try {
+    const res = await fetch(`${kv.url}/get/${encodeURIComponent(key)}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${kv.token}` },
+    });
+    if (!res.ok) return { ok: false, found: false, value: null };
+    const body = (await res.json()) as { result?: unknown };
+    if (body?.result == null) return { ok: true, found: false, value: null };
+    if (typeof body.result === 'string') {
+      return { ok: true, found: true, value: JSON.parse(body.result) as T };
+    }
+    return { ok: true, found: true, value: body.result as T };
+  } catch {
+    return { ok: false, found: false, value: null };
+  }
+}
 
 async function kvGetJson<T>(key: string): Promise<T | null> {
-  if (!isSharedKvEnabled) return null;
-  try {
-    const res = await fetch(`${KV_REST_URL}/get/${encodeURIComponent(key)}`, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${KV_REST_TOKEN}` },
-    });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { result?: unknown };
-    if (body?.result == null) return null;
-    if (typeof body.result === 'string') {
-      return JSON.parse(body.result) as T;
-    }
-    return body.result as T;
-  } catch {
-    return null;
-  }
+  const res = await kvGetResult<T>(key);
+  return res.found ? res.value : null;
 }
 
 const pendingKvWrites = new Set<Promise<void>>();
@@ -182,17 +199,18 @@ function trackKvWrite(task: Promise<void>): Promise<void> {
 }
 
 async function kvSetJson(key: string, value: unknown, ttlSeconds?: number): Promise<void> {
-  if (!isSharedKvEnabled) return;
+  const kv = getKvConfig();
+  if (!kv.enabled) return;
   const run = (async () => {
     try {
       const serialized = JSON.stringify(value);
       const endpoint = ttlSeconds
-        ? `${KV_REST_URL}/set/${encodeURIComponent(key)}?EX=${Math.max(1, Math.floor(ttlSeconds))}`
-        : `${KV_REST_URL}/set/${encodeURIComponent(key)}`;
+        ? `${kv.url}/set/${encodeURIComponent(key)}?EX=${Math.max(1, Math.floor(ttlSeconds))}`
+        : `${kv.url}/set/${encodeURIComponent(key)}`;
       await fetch(endpoint, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${KV_REST_TOKEN}`,
+          Authorization: `Bearer ${kv.token}`,
           'Content-Type': 'text/plain; charset=utf-8',
         },
         body: serialized,
@@ -202,13 +220,43 @@ async function kvSetJson(key: string, value: unknown, ttlSeconds?: number): Prom
   return trackKvWrite(run);
 }
 
-async function kvDel(key: string): Promise<void> {
-  if (!isSharedKvEnabled) return;
+async function kvSetNxJson(key: string, value: unknown): Promise<void> {
+  const kv = getKvConfig();
+  if (!kv.enabled) return;
   const run = (async () => {
     try {
-      await fetch(`${KV_REST_URL}/del/${encodeURIComponent(key)}`, {
+      const serialized = JSON.stringify(value);
+      const res = await fetch(`${kv.url}/set/${encodeURIComponent(key)}?NX=true`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${KV_REST_TOKEN}` },
+        headers: {
+          Authorization: `Bearer ${kv.token}`,
+          'Content-Type': 'text/plain; charset=utf-8',
+        },
+        body: serialized,
+      });
+      if (!res.ok) {
+        await fetch(`${kv.url}/set/${encodeURIComponent(key)}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${kv.token}`,
+            'Content-Type': 'text/plain; charset=utf-8',
+          },
+          body: serialized,
+        });
+      }
+    } catch {}
+  })();
+  return trackKvWrite(run);
+}
+
+async function kvDel(key: string): Promise<void> {
+  const kv = getKvConfig();
+  if (!kv.enabled) return;
+  const run = (async () => {
+    try {
+      await fetch(`${kv.url}/del/${encodeURIComponent(key)}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${kv.token}` },
       });
     } catch {}
   })();
@@ -219,11 +267,25 @@ async function kvDel(key: string): Promise<void> {
 // HMAC-SIGNED SESSION TOKENS (Survives across serverless cold/warm containers)
 // -------------------------------------------------------------
 const EPHEMERAL_SESSION_SECRET = crypto.randomBytes(32).toString('hex');
-function getSessionSigningSecret(): string {
+let sharedKvSessionSecret: string | null = null;
+
+function getExplicitEnvSessionSecret(): string {
   return (
     process.env.SESSION_SECRET ||
     process.env.WAQAS_SESSION_SECRET ||
     process.env.AUTH_SECRET ||
+    ''
+  ).trim();
+}
+
+function hasConfiguredSessionSecret(): boolean {
+  return Boolean(getExplicitEnvSessionSecret() || (isSharedKvEnabled && sharedKvSessionSecret));
+}
+
+function getSessionSigningSecret(): string {
+  return (
+    getExplicitEnvSessionSecret() ||
+    sharedKvSessionSecret ||
     EPHEMERAL_SESSION_SECRET
   );
 }
@@ -1268,39 +1330,78 @@ function persistDevices() {
 }
 
 let lastKvHydrationAt = 0;
-async function hydrateSharedKvIfConfigured(force = false) {
+let inFlightKvHydration: Promise<void> | null = null;
+
+async function ensureSharedKvSessionSecret(): Promise<void> {
+  if (!isSharedKvEnabled || getExplicitEnvSessionSecret()) return;
+  if (sharedKvSessionSecret) return;
+
+  const existing = await kvGetResult<string>('waqas:session_secret');
+  if (existing.ok && existing.found && typeof existing.value === 'string' && existing.value.length >= 32) {
+    sharedKvSessionSecret = existing.value;
+    return;
+  }
+  if (existing.ok && !existing.found) {
+    const generated = crypto.randomBytes(32).toString('hex');
+    await kvSetNxJson('waqas:session_secret', generated);
+    const confirmed = await kvGetResult<string>('waqas:session_secret');
+    if (confirmed.ok && confirmed.found && typeof confirmed.value === 'string' && confirmed.value.length >= 32) {
+      sharedKvSessionSecret = confirmed.value;
+    } else {
+      sharedKvSessionSecret = generated;
+    }
+  }
+}
+
+async function hydrateSharedKvIfConfigured(force = false): Promise<void> {
   if (!isSharedKvEnabled) return;
   const now = Date.now();
   if (!force && now - lastKvHydrationAt < 1500) return;
-  lastKvHydrationAt = now;
+  if (inFlightKvHydration) {
+    await inFlightKvHydration;
+    if (!force) return;
+  }
+
+  inFlightKvHydration = (async () => {
+    lastKvHydrationAt = Date.now();
+    try {
+      await ensureSharedKvSessionSecret();
+      const [kvAuthRes, kvSubsRes, kvDevsRes] = await Promise.all([
+        kvGetResult<AuthDb>('waqas:auth_db'),
+        kvGetResult<SubscriptionsData>('waqas:subscriptions_db'),
+        kvGetResult<{ devices?: DeviceInfo[]; removed?: string[] }>('waqas:devices_db'),
+      ]);
+
+      if (kvAuthRes.ok && kvAuthRes.found && kvAuthRes.value) {
+        authDb = normalizeLoadedAuthDb(kvAuthRes.value);
+      } else if (kvAuthRes.ok && !kvAuthRes.found) {
+        await kvSetJson('waqas:auth_db', authDb);
+      }
+
+      if (kvSubsRes.ok && kvSubsRes.found && kvSubsRes.value && Array.isArray(kvSubsRes.value.shops)) {
+        subscriptionsDb = kvSubsRes.value;
+      } else if (kvSubsRes.ok && !kvSubsRes.found) {
+        await kvSetJson('waqas:subscriptions_db', subscriptionsDb);
+      }
+
+      if (kvDevsRes.ok && kvDevsRes.found && kvDevsRes.value && Array.isArray(kvDevsRes.value.devices)) {
+        registeredDevices = kvDevsRes.value.devices;
+        removedDeviceIds.clear();
+        for (const rId of kvDevsRes.value.removed || []) removedDeviceIds.add(rId);
+      } else if (kvDevsRes.ok && !kvDevsRes.found) {
+        await kvSetJson('waqas:devices_db', {
+          devices: registeredDevices,
+          removed: Array.from(removedDeviceIds),
+        });
+      }
+    } catch {}
+  })();
 
   try {
-    const [kvAuth, kvSubs, kvDevs] = await Promise.all([
-      kvGetJson<AuthDb>('waqas:auth_db'),
-      kvGetJson<SubscriptionsData>('waqas:subscriptions_db'),
-      kvGetJson<{ devices?: DeviceInfo[]; removed?: string[] }>('waqas:devices_db'),
-    ]);
-    if (kvAuth) {
-      authDb = normalizeLoadedAuthDb(kvAuth);
-    } else {
-      await kvSetJson('waqas:auth_db', authDb);
-    }
-    if (kvSubs && Array.isArray(kvSubs.shops)) {
-      subscriptionsDb = kvSubs;
-    } else {
-      await kvSetJson('waqas:subscriptions_db', subscriptionsDb);
-    }
-    if (kvDevs && Array.isArray(kvDevs.devices)) {
-      registeredDevices = kvDevs.devices;
-      removedDeviceIds.clear();
-      for (const rId of kvDevs.removed || []) removedDeviceIds.add(rId);
-    } else {
-      await kvSetJson('waqas:devices_db', {
-        devices: registeredDevices,
-        removed: Array.from(removedDeviceIds),
-      });
-    }
-  } catch {}
+    await inFlightKvHydration;
+  } finally {
+    inFlightKvHydration = null;
+  }
 }
 
 async function ensureShopStoreHydratedFromKv(shopId: string): Promise<StoreData> {
@@ -1445,11 +1546,47 @@ export function getRuntimeInfo() {
     serverless: isServerlessRuntime,
     storageMode: isSharedKvEnabled ? 'vercel-kv' : resolvedStorage.storageMode,
     sharedAcrossInstances: isSharedKvEnabled || !isServerlessRuntime,
-    hasSessionSecret: Boolean(
-      process.env.SESSION_SECRET || process.env.WAQAS_SESSION_SECRET || process.env.AUTH_SECRET
-    ),
+    hasSessionSecret: hasConfiguredSessionSecret(),
     dataDir: DATA_DIR,
   };
+}
+
+function asyncHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<any>) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
+function isSignedTokenShape(token: string): boolean {
+  const parts = token.split('.');
+  return parts.length === 3 && (parts[0] === 'SA' || parts[0] === 'SO' || parts[0] === 'STF');
+}
+
+function extractSessionTokenFromReq(req: Request): string {
+  const candidates: string[] = [];
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    candidates.push(authHeader.substring(7).trim());
+  }
+  const headerTok = req.headers['x-session-token'];
+  if (typeof headerTok === 'string') {
+    candidates.push(headerTok.trim());
+  } else if (Array.isArray(headerTok) && headerTok[0]) {
+    candidates.push(String(headerTok[0]).trim());
+  }
+  if (req.query?.token && typeof req.query.token === 'string') {
+    candidates.push(req.query.token.trim());
+  }
+  if (req.body && typeof req.body === 'object' && req.body.sessionToken) {
+    candidates.push(String(req.body.sessionToken).trim());
+  }
+
+  for (const raw of candidates) {
+    if (raw && raw !== 'null' && raw !== 'undefined') {
+      return raw;
+    }
+  }
+  return '';
 }
 
 export function createApiApp(): Application {
@@ -1494,13 +1631,20 @@ export function createApiApp(): Application {
   if (isSharedKvEnabled) {
     app.use('/api', async (req: Request, _res: Response, next: NextFunction) => {
       if (req.path === '/health' || req.path === '/ping') return next();
-      await hydrateSharedKvIfConfigured();
-      next();
+      try {
+        await hydrateSharedKvIfConfigured();
+        next();
+      } catch (err) {
+        next(err);
+      }
     });
   }
 
   // Health & ping routes
-  app.get('/api/health', (_req: Request, res: Response) => {
+  app.get('/api/health', asyncHandler(async (_req: Request, res: Response) => {
+    if (isSharedKvEnabled && !sharedKvSessionSecret) {
+      await ensureSharedKvSessionSecret();
+    }
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.json({
       status: 'healthy',
@@ -1512,7 +1656,7 @@ export function createApiApp(): Application {
       devicesConnected: registeredDevices.length,
       runtime: getRuntimeInfo(),
     });
-  });
+  }));
 
   app.get('/api/ping', (_req: Request, res: Response) => {
     res.json({ pong: true, time: Date.now(), serverless: isServerlessRuntime });
@@ -1536,18 +1680,7 @@ export function createApiApp(): Application {
   // -------------------------------------------------------------
   // 1. CENTRALIZED AUTHENTICATION (SUPER ADMIN, SHOP OWNER, STAFF)
   // -------------------------------------------------------------
-  function getSessionFromReq(req: Request): AuthSessionData | null {
-    const authHeader = req.headers.authorization;
-    let token = '';
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      token = authHeader.substring(7).trim();
-    } else if (req.headers['x-session-token']) {
-      token = String(req.headers['x-session-token']).trim();
-    } else if (req.query?.token && typeof req.query.token === 'string') {
-      token = req.query.token.trim();
-    } else if (req.body && req.body.sessionToken) {
-      token = String(req.body.sessionToken).trim();
-    }
+  function getSessionFromToken(token: string): AuthSessionData | null {
     if (!token) return null;
 
     const storedSession = authDb.sessions[token];
@@ -1566,6 +1699,37 @@ export function createApiApp(): Application {
       return verified;
     }
     return null;
+  }
+
+  function getSessionFromReq(req: Request): AuthSessionData | null {
+    return getSessionFromToken(extractSessionTokenFromReq(req));
+  }
+
+  async function getSessionFromReqAsync(req: Request): Promise<{
+    session: AuthSessionData | null;
+    token: string;
+    ephemeralContainerMismatch: boolean;
+  }> {
+    const token = extractSessionTokenFromReq(req);
+    if (!token) {
+      return { session: null, token: '', ephemeralContainerMismatch: false };
+    }
+
+    let session = getSessionFromToken(token);
+    if (!session && isSharedKvEnabled) {
+      await hydrateSharedKvIfConfigured(true);
+      session = getSessionFromToken(token);
+    }
+
+    const ephemeralContainerMismatch = Boolean(
+      !session &&
+        isSignedTokenShape(token) &&
+        isServerlessRuntime &&
+        !hasConfiguredSessionSecret() &&
+        !isSharedKvEnabled
+    );
+
+    return { session, token, ephemeralContainerMismatch };
   }
 
   function checkAndAutoExpireSubscriptions() {
@@ -1667,9 +1831,9 @@ export function createApiApp(): Application {
     session?: AuthSessionData;
   }
 
-  function resolveShopActor(req: Request): ResolvedActor {
+  async function resolveShopActorAsync(req: Request): Promise<ResolvedActor> {
     checkAndAutoExpireSubscriptions();
-    const session = getSessionFromReq(req);
+    const { session, ephemeralContainerMismatch } = await getSessionFromReqAsync(req);
     const deviceId =
       (req.headers['x-device-id'] as string) ||
       (req.query.deviceId as string) ||
@@ -1681,7 +1845,15 @@ export function createApiApp(): Application {
       '';
 
     if (deviceId) {
-      const devCheck = verifyDeviceAccess(deviceId, deviceToken || undefined);
+      let devCheck = verifyDeviceAccess(deviceId, deviceToken || undefined);
+      if (
+        !devCheck.allowed &&
+        isSharedKvEnabled &&
+        (devCheck.error === 'DEVICE_UNKNOWN' || devCheck.error === 'INVALID_DEVICE_TOKEN')
+      ) {
+        await hydrateSharedKvIfConfigured(true);
+        devCheck = verifyDeviceAccess(deviceId, deviceToken || undefined);
+      }
       if (!devCheck.allowed) {
         const isSuperAdminSession = session?.role === 'SUPER_ADMIN';
         const isStaleTokenWithActiveSession =
@@ -1730,7 +1902,11 @@ export function createApiApp(): Application {
       }
 
       const shopId = session.shopId || '';
-      const shop = subscriptionsDb.shops.find((s) => s.id === shopId);
+      let shop = subscriptionsDb.shops.find((s) => s.id === shopId);
+      if (!shop && isSharedKvEnabled) {
+        await hydrateSharedKvIfConfigured(true);
+        shop = subscriptionsDb.shops.find((s) => s.id === shopId);
+      }
       if (!shop) {
         return {
           ok: false,
@@ -1770,7 +1946,7 @@ export function createApiApp(): Application {
 
       let livePermissions = session.permissions;
       if (session.role === 'STAFF' && session.staffId) {
-        const shopStore = getShopStore(shopId);
+        const shopStore = await ensureShopStoreHydratedFromKv(shopId);
         const staff = (shopStore.staffList || []).find((st) => st.id === session.staffId);
         if (!staff || staff.accountStatus !== 'active') {
           return {
@@ -1801,7 +1977,11 @@ export function createApiApp(): Application {
     }
 
     if (deviceId && deviceToken) {
-      const dev = registeredDevices.find((d) => d.deviceId === deviceId && d.sessionToken === deviceToken);
+      let dev = registeredDevices.find((d) => d.deviceId === deviceId && d.sessionToken === deviceToken);
+      if (!dev && isSharedKvEnabled) {
+        await hydrateSharedKvIfConfigured(true);
+        dev = registeredDevices.find((d) => d.deviceId === deviceId && d.sessionToken === deviceToken);
+      }
       if (dev && dev.status === 'active') {
         const shopId = dev.shopId || 'SHOP-WM-001';
         const shop = subscriptionsDb.shops.find((s) => s.id === shopId);
@@ -1839,6 +2019,20 @@ export function createApiApp(): Application {
       }
     }
 
+    if (ephemeralContainerMismatch) {
+      console.warn('[Auth] Session token rejected on serverless instance without shared SESSION_SECRET or KV store.');
+      return {
+        ok: false,
+        statusCode: 401,
+        error: 'SERVERLESS_SESSION_SECRET_MISSING',
+        message:
+          'Session verification failed across Vercel serverless instances because SESSION_SECRET (or Vercel KV) is not configured in Vercel Environment Variables. Add SESSION_SECRET in Vercel Project Settings and redeploy.',
+        role: 'STAFF',
+        shopId: '',
+        actorEmail: 'anonymous',
+      };
+    }
+
     return {
       ok: false,
       statusCode: 401,
@@ -1851,15 +2045,27 @@ export function createApiApp(): Application {
   }
 
   function requireSuperAdmin(req: Request, res: Response, next: NextFunction) {
-    const session = getSessionFromReq(req);
-    if (!session) {
-      return res.status(401).json({ success: false, error: 'AUTH_REQUIRED', message: 'Super Admin authentication required.' });
-    }
-    if (session.role !== 'SUPER_ADMIN' || !authDb.superAdmin) {
-      return res.status(403).json({ success: false, error: 'SUPER_ADMIN_ONLY', message: 'Access restricted to Primary Super Admin.' });
-    }
-    (req as any).superAdminSession = session;
-    next();
+    getSessionFromReqAsync(req)
+      .then(({ session, ephemeralContainerMismatch }) => {
+        if (!session) {
+          if (ephemeralContainerMismatch) {
+            console.warn('[Auth] Super Admin session rejected on serverless instance without shared SESSION_SECRET or KV store.');
+            return res.status(401).json({
+              success: false,
+              error: 'SERVERLESS_SESSION_SECRET_MISSING',
+              message:
+                'Super Admin session failed across Vercel serverless instances because SESSION_SECRET (or Vercel KV) is not configured in Vercel Environment Variables. Add SESSION_SECRET in Vercel Project Settings and redeploy.',
+            });
+          }
+          return res.status(401).json({ success: false, error: 'AUTH_REQUIRED', message: 'Super Admin authentication required.' });
+        }
+        if (session.role !== 'SUPER_ADMIN' || !authDb.superAdmin) {
+          return res.status(403).json({ success: false, error: 'SUPER_ADMIN_ONLY', message: 'Access restricted to Primary Super Admin.' });
+        }
+        (req as any).superAdminSession = session;
+        next();
+      })
+      .catch(next);
   }
 
   function checkRateLimit(key: string): { blocked: boolean; retrySeconds?: number } {
@@ -2116,21 +2322,29 @@ export function createApiApp(): Application {
     const lowerIdent = cleanIdent.toLowerCase();
     const normPhoneIdent = normalizeMobile(cleanIdent);
 
-    let ownerUser = authDb.users.find(
-      (u) =>
-        u.role === 'SHOP_OWNER' &&
-        (u.shopId?.trim().toLowerCase() === lowerIdent ||
-          u.username?.trim().toLowerCase() === lowerIdent ||
-          u.email?.trim().toLowerCase() === lowerIdent ||
-          (normPhoneIdent && normalizeMobile(u.phone || '') === normPhoneIdent))
-    );
+    const findOwnerAndShop = () => {
+      const foundOwner = authDb.users.find(
+        (u) =>
+          u.role === 'SHOP_OWNER' &&
+          (u.shopId?.trim().toLowerCase() === lowerIdent ||
+            u.username?.trim().toLowerCase() === lowerIdent ||
+            u.email?.trim().toLowerCase() === lowerIdent ||
+            (normPhoneIdent && normalizeMobile(u.phone || '') === normPhoneIdent))
+      );
+      const foundShop = subscriptionsDb.shops.find(
+        (s) =>
+          s.id.trim().toLowerCase() === lowerIdent ||
+          (s.ownerUsername && s.ownerUsername.trim().toLowerCase() === lowerIdent) ||
+          (s.email && s.email.trim().toLowerCase() === lowerIdent)
+      );
+      return { foundOwner, foundShop };
+    };
 
-    const matchedShop = subscriptionsDb.shops.find(
-      (s) =>
-        s.id.trim().toLowerCase() === lowerIdent ||
-        (s.ownerUsername && s.ownerUsername.trim().toLowerCase() === lowerIdent) ||
-        (s.email && s.email.trim().toLowerCase() === lowerIdent)
-    );
+    let { foundOwner: ownerUser, foundShop: matchedShop } = findOwnerAndShop();
+    if (!ownerUser && !matchedShop && isSharedKvEnabled) {
+      await hydrateSharedKvIfConfigured(true);
+      ({ foundOwner: ownerUser, foundShop: matchedShop } = findOwnerAndShop());
+    }
 
     if (!ownerUser && matchedShop) {
       ownerUser = authDb.users.find((u) => u.role === 'SHOP_OWNER' && u.shopId === matchedShop.id);
@@ -2309,9 +2523,17 @@ export function createApiApp(): Application {
     });
   });
 
-  app.get('/api/auth/me', async (req: Request, res: Response) => {
-    const session = getSessionFromReq(req);
+  app.get('/api/auth/me', asyncHandler(async (req: Request, res: Response) => {
+    const { session, ephemeralContainerMismatch } = await getSessionFromReqAsync(req);
     if (!session) {
+      if (ephemeralContainerMismatch) {
+        return res.status(401).json({
+          success: false,
+          error: 'SERVERLESS_SESSION_SECRET_MISSING',
+          message:
+            'Session could not be verified across Vercel serverless instances because SESSION_SECRET (or Vercel KV) is missing.',
+        });
+      }
       return res.status(401).json({ success: false, error: 'SESSION_INVALID', message: 'Not authenticated.' });
     }
     if (session.role === 'SUPER_ADMIN') {
@@ -2327,7 +2549,11 @@ export function createApiApp(): Application {
     }
 
     checkAndAutoExpireSubscriptions();
-    const shop = subscriptionsDb.shops.find((s) => s.id === session.shopId);
+    let shop = subscriptionsDb.shops.find((s) => s.id === session.shopId);
+    if (!shop && isSharedKvEnabled) {
+      await hydrateSharedKvIfConfigured(true);
+      shop = subscriptionsDb.shops.find((s) => s.id === session.shopId);
+    }
     if (!shop || shop.status === 'inactive' || shop.status === 'suspended' || shop.status === 'blocked' || shop.status === 'expired') {
       return res.status(403).json({
         success: false,
@@ -2354,12 +2580,14 @@ export function createApiApp(): Application {
       shop,
       expiresAt: new Date(session.expiresAt).toISOString(),
     });
-  });
+  }));
 
-  app.post('/api/auth/logout', (req: Request, res: Response) => {
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
+  app.post('/api/auth/logout', asyncHandler(async (req: Request, res: Response) => {
+    const token = extractSessionTokenFromReq(req);
     if (token) {
+      if (isSharedKvEnabled) {
+        await hydrateSharedKvIfConfigured(true);
+      }
       if (authDb.sessions[token]) {
         delete authDb.sessions[token];
       }
@@ -2371,10 +2599,10 @@ export function createApiApp(): Application {
       persistAuthDb();
     }
     return res.json({ success: true, message: 'Signed out cleanly.' });
-  });
+  }));
 
-  app.post('/api/auth/change-password', (req: Request, res: Response) => {
-    const session = getSessionFromReq(req);
+  app.post('/api/auth/change-password', asyncHandler(async (req: Request, res: Response) => {
+    const { session } = await getSessionFromReqAsync(req);
     if (!session) {
       return res.status(401).json({ success: false, message: 'Authentication required.' });
     }
@@ -2415,13 +2643,13 @@ export function createApiApp(): Application {
 
     recordAuditLog('PASSWORD_CHANGED', user.username || user.email || user.id, session.role, 'Account password updated.', user.shopId, req.ip);
     return res.json({ success: true, message: 'Password updated successfully.' });
-  });
+  }));
 
   // -------------------------------------------------------------
   // 2. DEVICE PAIRING & QR CODE MANAGEMENT (PER-SHOP SCOPED)
   // -------------------------------------------------------------
-  app.post('/api/devices/pairing-session', async (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.post('/api/devices/pairing-session', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -2451,7 +2679,7 @@ export function createApiApp(): Application {
       storeName: shopStore.branding.storeName || 'WAQAS MART',
       subtitle: shopStore.branding.subtitle || 'Supermarket Management',
     });
-  });
+  }));
 
   app.get('/api/devices/pairing-status/:token', async (req: Request, res: Response) => {
     const { token } = req.params;
@@ -2572,8 +2800,8 @@ export function createApiApp(): Application {
     });
   });
 
-  app.post('/api/devices/approve-pairing', async (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.post('/api/devices/approve-pairing', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -2667,10 +2895,10 @@ export function createApiApp(): Application {
       message: 'Device successfully authorized!',
       device: newDev,
     });
-  });
+  }));
 
-  app.post('/api/devices/register-primary', (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.post('/api/devices/register-primary', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -2738,9 +2966,9 @@ export function createApiApp(): Application {
       payload: registeredDevices.filter((d) => d.shopId === actor.shopId).map((d) => ({ ...d, sessionToken: undefined })),
     });
     return res.json({ success: true, device: primaryDev, sessionToken });
-  });
+  }));
 
-  app.post('/api/devices/cancel-pairing', async (req: Request, res: Response) => {
+  app.post('/api/devices/cancel-pairing', asyncHandler(async (req: Request, res: Response) => {
     const { pairingToken } = req.body || {};
     if (pairingToken) {
       const s = await findPairingSessionShared(String(pairingToken));
@@ -2750,13 +2978,13 @@ export function createApiApp(): Application {
       }
     }
     return res.json({ success: true, message: 'Pairing cancelled.' });
-  });
+  }));
 
   // -------------------------------------------------------------
   // 3. DEVICE MANAGEMENT ENDPOINTS (SHOP-SCOPED OR SUPER ADMIN)
   // -------------------------------------------------------------
-  app.get('/api/devices', (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.get('/api/devices', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -2774,10 +3002,10 @@ export function createApiApp(): Application {
       };
     });
     return res.json({ success: true, devices: list });
-  });
+  }));
 
-  app.post('/api/devices/:id/rename', (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.post('/api/devices/:id/rename', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -2802,10 +3030,10 @@ export function createApiApp(): Application {
     });
 
     return res.json({ success: true, device: { ...target, sessionToken: undefined } });
-  });
+  }));
 
-  app.post('/api/devices/:id/revoke', (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.post('/api/devices/:id/revoke', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -2846,10 +3074,10 @@ export function createApiApp(): Application {
     });
 
     return res.json({ success: true, message: 'Device access revoked successfully.' });
-  });
+  }));
 
-  app.post('/api/devices/:id/restore', (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.post('/api/devices/:id/restore', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -2872,9 +3100,9 @@ export function createApiApp(): Application {
       payload: registeredDevices.filter((d) => d.shopId === targetShopId).map((d) => ({ ...d, sessionToken: undefined })),
     });
     return res.json({ success: true, message: 'Device access restored.', device: { ...target, sessionToken: undefined } });
-  });
+  }));
 
-  app.get('/api/devices/check-status', (req: Request, res: Response) => {
+  app.get('/api/devices/check-status', asyncHandler(async (req: Request, res: Response) => {
     const deviceId =
       (req.headers['x-device-id'] as string) ||
       (req.query.deviceId as string) ||
@@ -2893,7 +3121,15 @@ export function createApiApp(): Application {
       });
     }
 
-    const devCheck = verifyDeviceAccess(deviceId, deviceToken);
+    let devCheck = verifyDeviceAccess(deviceId, deviceToken);
+    if (
+      !devCheck.allowed &&
+      isSharedKvEnabled &&
+      (devCheck.error === 'DEVICE_UNKNOWN' || devCheck.error === 'INVALID_DEVICE_TOKEN')
+    ) {
+      await hydrateSharedKvIfConfigured(true);
+      devCheck = verifyDeviceAccess(deviceId, deviceToken);
+    }
     if (!devCheck.allowed || !devCheck.device) {
       return res.status(devCheck.statusCode || 403).json({
         success: false,
@@ -2919,10 +3155,10 @@ export function createApiApp(): Application {
       allowed: true,
       device: { ...devCheck.device, sessionToken: undefined },
     });
-  });
+  }));
 
-  app.delete('/api/devices/:id', (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.delete('/api/devices/:id', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -2962,13 +3198,13 @@ export function createApiApp(): Application {
     });
 
     return res.json({ success: true, message: 'Device removed.' });
-  });
+  }));
 
   // -------------------------------------------------------------
   // 4. REAL-TIME SERVER-SENT EVENTS (SSE) STREAM (PER-SHOP SCOPED)
   // -------------------------------------------------------------
-  app.get('/api/sync/events', async (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.get('/api/sync/events', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -3042,13 +3278,13 @@ export function createApiApp(): Application {
         payload: remaining,
       });
     });
-  });
+  }));
 
   // -------------------------------------------------------------
   // 5. AUTHORITATIVE PER-SHOP STORE STATE & ATOMIC MUTATIONS
   // -------------------------------------------------------------
-  app.get('/api/store/state', async (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.get('/api/store/state', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -3060,7 +3296,7 @@ export function createApiApp(): Application {
       syncVersion: shopStore.syncVersion || 1,
       store: safeStore,
     });
-  });
+  }));
 
   function canStaffPerformMutation(action: string, perms?: StaffModulePermissions): boolean {
     if (!perms) return false;
@@ -3108,8 +3344,8 @@ export function createApiApp(): Application {
     }
   }
 
-  app.post('/api/store/sync', async (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.post('/api/store/sync', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({
         success: false,
@@ -4020,7 +4256,7 @@ export function createApiApp(): Application {
       default:
         return res.status(400).json({ success: false, message: `Unknown action: ${action}` });
     }
-  });
+  }));
 
   // -------------------------------------------------------------
   // 6. SUPER ADMIN CONSOLE, MULTI-SHOP, SUBSCRIPTIONS & BACKUP API
@@ -4901,8 +5137,7 @@ export function createApiApp(): Application {
   });
 
   app.post('/api/super-admin/sessions/revoke-others', requireSuperAdmin, (req: Request, res: Response) => {
-    const authHeader = req.headers.authorization;
-    const currentTok = authHeader?.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
+    const currentTok = extractSessionTokenFromReq(req);
     const currentSess = (req as any).superAdminSession as AuthSessionData;
     let revoked = 0;
     for (const [tok, sess] of Object.entries(authDb.sessions)) {
@@ -4926,8 +5161,8 @@ export function createApiApp(): Application {
     return res.json({ success: true, message: `Terminated ${revoked} other Super Admin session(s).` });
   });
 
-  app.get('/api/settings/mart-owner', async (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.get('/api/settings/mart-owner', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -4957,10 +5192,10 @@ export function createApiApp(): Application {
         isPermanentlyLocked: true,
       },
     });
-  });
+  }));
 
-  app.post('/api/settings/mart-owner', async (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.post('/api/settings/mart-owner', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -4983,7 +5218,7 @@ export function createApiApp(): Application {
       payload: shopStore,
     });
     return res.json({ success: true, martOwner: shopStore.martOwner });
-  });
+  }));
 
   app.get('/api/super-admin/backup/export', requireSuperAdmin, (_req: Request, res: Response) => {
     const allShopData: Record<string, any> = {};
@@ -5055,8 +5290,8 @@ export function createApiApp(): Application {
     return res.json({ success: true, message: 'System backup restored across shops.' });
   });
 
-  app.get('/api/shop/backup/export', async (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.get('/api/shop/backup/export', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -5075,10 +5310,10 @@ export function createApiApp(): Application {
         storeDb: shopStore,
       },
     });
-  });
+  }));
 
-  app.post('/api/shop/backup/import', async (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.post('/api/shop/backup/import', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -5133,10 +5368,10 @@ export function createApiApp(): Application {
     });
 
     return res.json({ success: true, message: 'Shop backup restored & synchronized.', store: updated });
-  });
+  }));
 
-  app.get('/api/security/overview', async (req: Request, res: Response) => {
-    const actor = resolveShopActor(req);
+  app.get('/api/security/overview', asyncHandler(async (req: Request, res: Response) => {
+    const actor = await resolveShopActorAsync(req);
     if (!actor.ok) {
       return res.status(actor.statusCode).json({ success: false, error: actor.error, message: actor.message });
     }
@@ -5155,7 +5390,7 @@ export function createApiApp(): Application {
       syncVersion: shopStore.syncVersion || 1,
       auditLogs: shopAudit,
     });
-  });
+  }));
 
   // Catch-all for unmatched /api/* routes: guarantees JSON instead of HTML
   app.all('/api/*', (req: Request, res: Response) => {

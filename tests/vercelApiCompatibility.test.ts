@@ -276,7 +276,231 @@ async function runTests() {
       globalThis.fetch = origFetch;
     }
 
-    console.log('✅ ALL VERCEL PRODUCTION COMPATIBILITY TESTS PASSED!');
+    console.log('11. Multi-container Vercel Serverless test (Container A login -> Container B Create Mart & Multi Connect QR)...');
+    const kvStore = new Map<string, string>();
+    const kvServer = http.createServer((req, res) => {
+      const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
+      if (req.headers.authorization !== 'Bearer mock-kv-token') {
+        res.statusCode = 401;
+        return res.end(JSON.stringify({ error: 'Unauthorized' }));
+      }
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        const rawBody = Buffer.concat(chunks).toString('utf8');
+        if (urlObj.pathname.startsWith('/get/')) {
+          const key = decodeURIComponent(urlObj.pathname.slice('/get/'.length));
+          const val = kvStore.has(key) ? kvStore.get(key)! : null;
+          res.setHeader('Content-Type', 'application/json');
+          return res.end(JSON.stringify({ result: val }));
+        }
+        if (urlObj.pathname.startsWith('/set/')) {
+          const key = decodeURIComponent(urlObj.pathname.slice('/set/'.length));
+          const isNx = urlObj.searchParams.get('NX') === 'true';
+          if (isNx && kvStore.has(key)) {
+            res.setHeader('Content-Type', 'application/json');
+            return res.end(JSON.stringify({ result: null }));
+          }
+          kvStore.set(key, rawBody);
+          res.setHeader('Content-Type', 'application/json');
+          return res.end(JSON.stringify({ result: 'OK' }));
+        }
+        if (urlObj.pathname.startsWith('/del/')) {
+          const key = decodeURIComponent(urlObj.pathname.slice('/del/'.length));
+          kvStore.delete(key);
+          res.setHeader('Content-Type', 'application/json');
+          return res.end(JSON.stringify({ result: 1 }));
+        }
+        res.statusCode = 404;
+        res.end('{}');
+      });
+    });
+    await new Promise<void>((resolve) => kvServer.listen(0, '127.0.0.1', resolve));
+    const kvPort = (kvServer.address() as { port: number }).port;
+    const kvUrl = `http://127.0.0.1:${kvPort}`;
+
+    const { spawn } = await import('node:child_process');
+    const spawnWorkerContainer = async (name: string, extraEnv: Record<string, string>) => {
+      const containerDir = path.join(tempRoot, `container-${name}`);
+      fs.mkdirSync(containerDir, { recursive: true });
+      fs.cpSync(path.join(process.cwd(), 'data'), containerDir, { recursive: true });
+      const workerCode = `
+        import http from 'node:http';
+        import handler from './api/index.ts';
+        const srv = http.createServer((req, res) => { void handler(req, res); });
+        srv.listen(0, '127.0.0.1', () => {
+          const addr = srv.address();
+          process.stdout.write('READY:' + addr.port + '\\n');
+        });
+      `;
+      const env: Record<string, string> = {
+        ...process.env as Record<string, string>,
+        VERCEL: '1',
+        VERCEL_ENV: 'production',
+        WAQAS_DATA_DIR: containerDir,
+        SUPER_ADMIN_EMAIL: testSaEmail,
+        SUPER_ADMIN_PASSWORD_SALT: testSaSalt,
+        SUPER_ADMIN_PASSWORD_HASH: testSaHash,
+      };
+      delete env.SESSION_SECRET;
+      delete env.WAQAS_SESSION_SECRET;
+      delete env.AUTH_SECRET;
+      delete env.KV_REST_API_URL;
+      delete env.KV_REST_API_TOKEN;
+      Object.assign(env, extraEnv);
+
+      const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', workerCode], {
+        cwd: process.cwd(),
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const port = await new Promise<number>((resolve, reject) => {
+        let out = '';
+        let errOut = '';
+        const timer = setTimeout(() => reject(new Error(`Container ${name} timed out: ${errOut}`)), 15000);
+        child.stdout.on('data', (d) => {
+          out += d.toString();
+          const m = out.match(/READY:(\d+)/);
+          if (m) {
+            clearTimeout(timer);
+            resolve(Number(m[1]));
+          }
+        });
+        child.stderr.on('data', (d) => { errOut += d.toString(); });
+        child.on('exit', (code) => {
+          clearTimeout(timer);
+          reject(new Error(`Container ${name} exited (${code}): ${errOut}`));
+        });
+      });
+      return { child, baseUrl: `http://127.0.0.1:${port}` };
+    };
+
+    const containers: Array<{ child: any }> = [];
+    try {
+      // 11a. Two containers with shared KV and NO SESSION_SECRET set
+      const cA = await spawnWorkerContainer('kv-a', { KV_REST_API_URL: kvUrl, KV_REST_API_TOKEN: 'mock-kv-token' });
+      const cB = await spawnWorkerContainer('kv-b', { KV_REST_API_URL: kvUrl, KV_REST_API_TOKEN: 'mock-kv-token' });
+      containers.push(cA, cB);
+
+      // Warm up Container B FIRST so its 1500ms hydration cache is active
+      const warmB = await fetch(`${cB.baseUrl}/api/index?__api_path=auth/bootstrap-status`);
+      assert.equal(warmB.status, 200);
+
+      // Login as Super Admin on Container A
+      const loginA = await fetch(`${cA.baseUrl}/api/index?__api_path=auth/super-admin/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gmail: testSaEmail, password: testSaPassword }),
+      });
+      assert.equal(loginA.status, 200);
+      const loginAJson = await loginA.json();
+      const saTokA = loginAJson.token as string;
+      assert.ok(saTokA.startsWith('SA.'));
+
+      // Immediately create a new Mart on Container B (<1500ms after Container B warmed!)
+      const createShopB = await fetch(`${cB.baseUrl}/api/index?__api_path=super-admin/shops`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-session-token': saTokA,
+        },
+        body: JSON.stringify({
+          shopName: 'VERCEL MULTI MART',
+          ownerName: 'Usman Tariq',
+          username: 'usmanvercel',
+          password: 'MartPass#2026',
+          confirmPassword: 'MartPass#2026',
+          plan: '12_months',
+        }),
+      });
+      const createShopBJson = await createShopB.json();
+      assert.equal(createShopB.status, 200, `Expected Container B Create Mart 200, got ${createShopB.status}: ${JSON.stringify(createShopBJson)}`);
+      assert.equal(createShopBJson.success, true);
+
+      // Immediately open Multi Connect QR on Container B using Super Admin token from Container A
+      const qrSaB = await fetch(`${cB.baseUrl}/api/index?__api_path=devices/pairing-session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${saTokA}` },
+        body: '{}',
+      });
+      assert.equal(qrSaB.status, 200);
+
+      // Newly created Mart Owner logs in on Container A, opens Multi Connect QR on Container B
+      const ownerLoginA = await fetch(`${cA.baseUrl}/api/index?__api_path=auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ portal: 'shop', identifier: 'usmanvercel', password: 'MartPass#2026' }),
+      });
+      assert.equal(ownerLoginA.status, 200);
+      const ownerTokA = (await ownerLoginA.json()).token as string;
+
+      // Shop Owner MUST NOT be able to create marts on Super Admin route (403)
+      const shopCreateAttempt = await fetch(`${cB.baseUrl}/api/index?__api_path=super-admin/shops`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerTokA}` },
+        body: JSON.stringify({ shopName: 'Forbidden' }),
+      });
+      assert.equal(shopCreateAttempt.status, 403);
+
+      // Shop Owner opens Multi Connect QR on Container B -> 200 OK
+      const ownerQrB = await fetch(`${cB.baseUrl}/api/index?__api_path=devices/pairing-session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerTokA}` },
+        body: '{}',
+      });
+      assert.equal(ownerQrB.status, 200);
+      const ownerQrBJson = await ownerQrB.json();
+      assert.ok(ownerQrBJson.pairingToken);
+
+      // 11b. Two containers WITH SESSION_SECRET and NO KV
+      const cSecA = await spawnWorkerContainer('sec-a', { SESSION_SECRET: 'shared-vercel-secret-2026-test' });
+      const cSecB = await spawnWorkerContainer('sec-b', { SESSION_SECRET: 'shared-vercel-secret-2026-test' });
+      containers.push(cSecA, cSecB);
+
+      const loginSecA = await fetch(`${cSecA.baseUrl}/api/index?__api_path=auth/super-admin/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gmail: testSaEmail, password: testSaPassword }),
+      });
+      assert.equal(loginSecA.status, 200);
+      const tokSecA = (await loginSecA.json()).token as string;
+
+      const overviewSecB = await fetch(`${cSecB.baseUrl}/api/index?__api_path=super-admin/overview`, {
+        headers: { Authorization: `Bearer ${tokSecA}` },
+      });
+      assert.equal(overviewSecB.status, 200, 'Container B with shared SESSION_SECRET must accept Container A token');
+
+      const qrSecB = await fetch(`${cSecB.baseUrl}/api/index?__api_path=devices/pairing-session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokSecA}` },
+        body: '{}',
+      });
+      assert.equal(qrSecB.status, 200, 'Container B with shared SESSION_SECRET must issue QR pairing session');
+
+      // 11c. Diagnostic test: Two containers with NEITHER KV NOR SESSION_SECRET reject mismatched tokens cleanly (401 SERVERLESS_SESSION_SECRET_MISSING)
+      const cNoCfgA = await spawnWorkerContainer('nocfg-a', {});
+      const cNoCfgB = await spawnWorkerContainer('nocfg-b', {});
+      containers.push(cNoCfgA, cNoCfgB);
+      const loginNoCfgA = await fetch(`${cNoCfgA.baseUrl}/api/index?__api_path=auth/super-admin/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gmail: testSaEmail, password: testSaPassword }),
+      });
+      const tokNoCfgA = (await loginNoCfgA.json()).token as string;
+      const failNoCfgB = await fetch(`${cNoCfgB.baseUrl}/api/index?__api_path=super-admin/overview`, {
+        headers: { Authorization: `Bearer ${tokNoCfgA}` },
+      });
+      assert.equal(failNoCfgB.status, 401);
+      const failNoCfgJson = await failNoCfgB.json();
+      assert.equal(failNoCfgJson.error, 'SERVERLESS_SESSION_SECRET_MISSING');
+    } finally {
+      for (const c of containers) {
+        try { c.child.kill('SIGTERM'); } catch {}
+      }
+      await new Promise<void>((resolve) => kvServer.close(() => resolve()));
+    }
+
+    console.log('✅ ALL VERCEL PRODUCTION COMPATIBILITY & MULTI-CONTAINER TESTS PASSED!');
   } finally {
     if (server) {
       await new Promise<void>((resolve) => server!.close(() => resolve()));

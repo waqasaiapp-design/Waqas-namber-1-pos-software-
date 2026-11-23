@@ -513,7 +513,10 @@ class SyncService {
       const base = getApiBaseUrl();
       const authToken = this.getAuthToken();
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+      if (authToken) {
+        headers['Authorization'] = `Bearer ${authToken}`;
+        headers['x-session-token'] = authToken;
+      }
       const res = await fetch(`${base}/api/devices/register-primary`, {
         method: 'POST',
         headers,
@@ -679,6 +682,7 @@ class SyncService {
     const authToken = this.getAuthToken();
     if (authToken) {
       headers['Authorization'] = `Bearer ${authToken}`;
+      headers['x-session-token'] = authToken;
     }
     if (this.device.sessionToken) {
       headers['x-device-token'] = this.device.sessionToken;

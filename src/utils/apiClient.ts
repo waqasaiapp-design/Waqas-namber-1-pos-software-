@@ -278,6 +278,9 @@ export async function safeFetchJson<T = any>(
   if (token && !headers['Authorization'] && !headers['authorization']) {
     headers['Authorization'] = `Bearer ${token}`;
   }
+  if (token && !headers['x-session-token'] && !headers['X-Session-Token']) {
+    headers['x-session-token'] = token;
+  }
 
   if (deviceIdHeader && !headers['x-device-id'] && !headers['X-Device-Id']) {
     headers['x-device-id'] = deviceIdHeader;
